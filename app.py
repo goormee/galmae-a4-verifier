@@ -47,20 +47,32 @@ class ContractVerifier:
             return True, f"표준 격자선 및 면적 표 서식 감지됨 (가로줄 {line_count}개 확인)"
         return False, "계약서 특유의 표 양식(격자선)이 감지되지 않았습니다. 동·호수 및 면적 표가 포함된 페이지를 올바르게 업로드했는지 확인해 주세요."
 
-    # 기준 2. 도장(직인) 검증
+    # [핵심 개선] 기준 2. 도장(직인) 검증 - 흑백 사본 우회(Fallback) 탐지 알고리즘 추가
     def check_seal_and_position(self):
         blurred_cv = cv2.GaussianBlur(self.img_cv, (5, 5), 0)
         hsv = cv2.cvtColor(blurred_cv, cv2.COLOR_BGR2HSV)
         
-        lower_red1 = np.array([0, 50, 50])
-        upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([160, 50, 50]) 
-        upper_red2 = np.array([180, 255, 255])
+        # 1. 흑백 문서 여부 자동 판별 (채도 S 채널의 평균값이 극단적으로 낮으면 흑백으로 간주)
+        saturation = hsv[:, :, 1]
+        mean_saturation = np.mean(saturation)
+        is_grayscale = mean_saturation < 15
         
-        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-        mask = mask1 | mask2 
-        
+        if not is_grayscale:
+            # 컬러 원본: 붉은색(도장, 인장) 영역만 정밀하게 추출
+            lower_red1 = np.array([0, 50, 50])
+            upper_red1 = np.array([10, 255, 255])
+            lower_red2 = np.array([160, 50, 50]) 
+            upper_red2 = np.array([180, 255, 255])
+            
+            mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+            mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+            mask = mask1 | mask2 
+        else:
+            # 흑백 사본: 붉은색 필터를 무시하고 문서 내의 어두운 선과 글씨를 모두 추출하여 형태만으로 검증
+            gray_img = cv2.cvtColor(blurred_cv, cv2.COLOR_BGR2GRAY)
+            mask = cv2.adaptiveThreshold(gray_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10)
+
+        # 형태학적 변환 (글자나 테두리를 하나의 덩어리로 뭉침)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -74,16 +86,24 @@ class ContractVerifier:
             x, y, w, h = cv2.boundingRect(cnt)
             area = cv2.contourArea(cnt)
             
-            if area > 400 and w > 20 and h > 20:
+            # 너무 작거나 큰 덩어리(표 테두리 전체 등)를 노이즈로 간주하고 제외
+            if 400 < area < 30000 and w > 20 and h > 20:
                 aspect_ratio = w / float(h)
                 
+                # 조건 1. 정사각형 직인 또는 원형 서명 마크 (비율 0.6 ~ 1.4)
                 if 0.6 <= aspect_ratio <= 1.4:
                     valid_seal = True
-                    seal_msg = f"정사각형 LH 기관 직인 감지 완료 (비율: {aspect_ratio:.2f})"
+                    mode = "흑백 사본" if is_grayscale else "컬러 원본"
+                    seal_msg = f"[{mode}] 정사각형 LH 기관 직인 또는 서명 마크 형태 감지 완료 (비율: {aspect_ratio:.2f})"
                     break
+                # 조건 2. 직사각형 형태의 구형 타임스탬프 (비율 2.5 ~ 15.0)
                 elif 2.5 <= aspect_ratio <= 15.0:
+                    # 흑백 문서일 경우 일반 문장(텍스트 라인)을 긴 직사각형으로 오해할 수 있으므로, 크기 조건을 상향하여 방어
+                    if is_grayscale and (w < 80 or h < 20):
+                        continue
                     valid_seal = True
-                    seal_msg = f"공인전자서명(타임스탬프) 인장 감지 완료 (비율: {aspect_ratio:.2f})"
+                    mode = "흑백 사본" if is_grayscale else "컬러 원본"
+                    seal_msg = f"[{mode}] 공인전자서명(타임스탬프) 인장 형태 감지 완료 (비율: {aspect_ratio:.2f})"
                     break
 
         if valid_seal:
@@ -118,9 +138,9 @@ class ContractVerifier:
                 elif has_rental_word:
                     return False, "현재 '분양형'으로 가입 신청을 하셨으나, 첨부된 서류는 '선택형/임대차' 계약서로 확인됩니다. 상단의 계약 유형 선택을 다시 확인해 주세요."
                 elif is_sales_type and (not is_lh or not is_head):
-                    return False, f"분양자 명의 단어가 일부 누락되었거나 사진이 흐립니다. (LH 검출: {'성공' if is_lh else '실패'}, 경기북부지역본부장 검출: {'성공' if is_head else '실패'})"
+                    return False, f"분양자 명의 정보가 일치하지 않거나 글자가 흐립니다. (LH 정보 인식: {'성공' if is_lh else '실패'}, 경기북부지역본부장 인식: {'성공' if is_head else '실패'})"
                 else:
-                    return False, "분양 계약서의 핵심 용어(수분양자, 분양계약 등)가 분석되지 않았습니다. 업로드한 이미지가 아파트 공급계약서 첫 페이지가 맞는지 확인해 주세요."
+                    return False, "분양계약서의 필수 단어(수분양자, 공급면적 등)를 찾을 수 없습니다. 아파트 공급 계약서 첫 페이지가 맞는지 확인해 주세요."
             
             # 2. [선택형/임대] 검증 로직
             else: 
@@ -142,10 +162,11 @@ class ContractVerifier:
     # [스마트 동/호수 추출기]
     def extract_dong_ho(self):
         if not self.full_text:
-            return False, "텍스트가 추출되지 않았습니다."
+            return False, "문서에서 텍스트가 추출되지 않아 판독이 불가능합니다."
             
         text_clean = re.sub(r'[^0-9가-힣]', '', self.full_text)
         
+        # 개인 주소 필터링용 슬라이싱
         split_keywords = ["주택의표시", "주택의표", "공공임대주택", "공공분양주택", "4주택", "3공공임대"]
         for ckw in split_keywords:
             if ckw in text_clean:
@@ -153,6 +174,7 @@ class ContractVerifier:
                 text_clean = text_clean[idx:]
                 break
         
+        # '408등 503호' 오타도 통과시키는 실버불릿 정규식 패턴
         pattern = r'(\d{1,4})[동통돔덤등][^0-9]*?(\d{1,4})'
         match = re.search(pattern, text_clean)
         
@@ -161,7 +183,7 @@ class ContractVerifier:
             ho = str(int(match.group(2)))
             return True, f"{dong}동 {ho}호"
             
-        return False, "계약서 본문에서 동/호수 숫자를 명확하게 판독해내지 못했습니다. 사진의 해상도를 높이거나 테두리가 잘리지 않게 다시 찍어 주세요."
+        return False, "계약서 내부에서 동/호수 숫자 정보를 명확히 읽어내지 못했습니다. 빛 반사나 그림자가 없는지 확인 후 다시 촬영해주세요."
 
 # --- Streamlit 웹 UI 구현부 ---
 st.set_page_config(page_title="LH 계약서 진위 판별기", layout="wide")
@@ -243,7 +265,6 @@ if submit_button:
                         st.warning(f"⚠️ {dong_ho_msg}")
                         st.error("🚨 동/호수 추출 실패로 인해 가입 승인이 보류되었습니다.")
                 else:
-                    # [개선부] 사용자가 한눈에 알아볼 수 있도록 직관적인 '검증 실패 사유 요약 서머리 리포트' 출력
                     st.error("🚨 **최종 가입 승인 거절:** 계약서 자동 인증 기준을 통과하지 못했습니다. 원활한 가입 승인을 위해 아래 요약된 실패 사유를 확인하고 보완해 주세요.")
                     
                     st.markdown("📋 **인증 반려 사유 요약 리포트**")
